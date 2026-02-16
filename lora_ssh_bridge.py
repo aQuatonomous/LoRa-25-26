@@ -5,7 +5,9 @@ Stop-and-wait: one packet at a time, ACK each before sending next.
 
 Jetson:  python3 lora_ssh_bridge.py jetson
 Windows: python lora_ssh_bridge.py win
-Then:    ssh -p 2222 lorenzo@127.0.0.1
+Then:    ssh -C -p 2222 user@127.0.0.1
+OR
+ssh -C -p 2222 -o "KexAlgorithms=curve25519-sha256" -o "Ciphers=aes128-ctr" -o "MACs=hmac-sha2-256" lorenzo@127.0.0.1
 """
 
 import sys, time, socket, select, logging, argparse
@@ -21,7 +23,7 @@ BAUD       = 9600
 
 FRAG_MAX    = 200
 MAX_RETRIES = 3
-RX_TIMEOUT  = 4.0
+RX_TIMEOUT  = 2.5          # tightened from 4.0
 
 T_DATA = 0x10
 T_ACK  = 0x20
@@ -130,7 +132,7 @@ def tx_raw(ser, payload):
     log.warning("TX: no txDone")
     return False
 
-def rx_packet(ser, timeout=4.0):
+def rx_packet(ser, timeout=2.5):
     buf = ""
     t = time.time() + timeout
     while time.time() < t:
@@ -206,7 +208,7 @@ def reliable_recv(ser, timeout=15.0):
         remaining = deadline - time.time()
         if remaining <= 0:
             break
-        pkt = rx_packet(ser, timeout=min(3.0, remaining))
+        pkt = rx_packet(ser, timeout=min(2.5, remaining))
         if pkt is None:
             continue
 
@@ -259,7 +261,7 @@ def tcp_drain(sock):
 # ── WINDOWS (master) ──────────────────────────────────────────
 
 def run_win(ser):
-    log.info(f"=== WINDOWS (MASTER) === ssh -p {LISTEN_PORT} 127.0.0.1")
+    log.info(f"=== WINDOWS (MASTER) === ssh -C -p {LISTEN_PORT} 127.0.0.1")
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", LISTEN_PORT))
@@ -272,24 +274,20 @@ def run_win(ser):
 
     try:
         while True:
-            # gather TCP data
-            time.sleep(0.05)
+            time.sleep(0.03)
             tcp_data = tcp_drain(cli)
             if tcp_data is None:
                 log.info("SSH client disconnected"); return
 
-            # send data fragments (each ACKed individually)
             if tcp_data:
                 log.debug(f"TCP→LoRa: {len(tcp_data)}B")
                 reliable_send(ser, tcp_data)
 
-            # send POLL
             tx_raw(ser, bytes([T_POLL]))
 
-            # receive Jetson's response
             rx_data = None
             while True:
-                data, marker = reliable_recv(ser, timeout=12.0)
+                data, marker = reliable_recv(ser, timeout=10.0)
                 if data:
                     rx_data = data
                     try:
@@ -303,9 +301,8 @@ def run_win(ser):
                     log.warning("Timeout waiting for DONE")
                     break
 
-            # slow down empty cycles to avoid hammering radio
             if not tcp_data and not rx_data:
-                time.sleep(0.5)
+                time.sleep(0.3)
 
     finally:
         cli.close(); srv.close()
@@ -317,7 +314,6 @@ def run_jetson(ser):
     ssh_sock = None
 
     while True:
-        # wait for data + POLL from Windows
         data_chunks = []
         while True:
             try:
@@ -346,7 +342,6 @@ def run_jetson(ser):
             if marker is None and data is None:
                 break
 
-        # forward received data to SSH
         for chunk in data_chunks:
             if ssh_sock is None:
                 log.info("Connecting to SSH...")
@@ -363,23 +358,19 @@ def run_jetson(ser):
             except OSError:
                 ssh_sock.close(); ssh_sock = None
 
-        # gather SSH response — extra time to let SSH process
-        time.sleep(0.15)
+        time.sleep(0.08)
         tcp_data = tcp_drain(ssh_sock) if ssh_sock else b""
         if tcp_data is None:
             log.info("SSH closed"); ssh_sock = None; tcp_data = b""
 
-        # send response (each frag ACKed)
         if tcp_data:
             log.debug(f"SSH→LoRa: {len(tcp_data)}B")
             reliable_send(ser, tcp_data)
 
-        # send DONE
         tx_raw(ser, bytes([T_DONE]))
 
-        # slow down empty cycles
         if not data_chunks and not tcp_data:
-            time.sleep(0.3)
+            time.sleep(0.2)
 
 # ── main ──────────────────────────────────────────────────────
 
