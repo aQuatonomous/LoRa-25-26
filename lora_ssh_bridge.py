@@ -20,9 +20,9 @@ LORA_GROUP = "1"
 BAUD       = 9600
 
 # fragmentation
-FRAG_MAX   = 220
-TX_DELAY   = 0.20       # gap between fragments
-RX_WINDOW  = 1.5        # seconds to listen after sending before allowing more sends
+FRAG_MAX    = 220
+QUIET_TIME  = 0.8   # seconds of radio silence before we're allowed to transmit
+IDLE_POLL   = 0.01  # main loop sleep
 
 # network
 LISTEN_PORT = 2222
@@ -31,6 +31,8 @@ SSH_PORT    = 22
 
 logging.basicConfig(level=logging.DEBUG, format="[%(asctime)s %(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("bridge")
+
+# serial helpers
 
 def at_cmd(ser, cmd, timeout=2.0):
     ser.reset_input_buffer()
@@ -74,7 +76,7 @@ def configure_la66(ser):
         f"AT+POWER={LORA_POWER}", f"AT+GROUPMOD={LORA_GROUP},{LORA_GROUP}",
         "AT+CRC=1,1", "AT+HEADER=0,0", "AT+IQ=0,0",
         "AT+SYNCWORD=0",
-        "AT+RXMOD=65535,0",  # always listening, NO auto-ACK (saves airtime)
+        "AT+RXMOD=65535,0",  # always listening, no auto-ACK
     ]:
         resp = at_cmd(ser, cmd)
         if "ERROR" in resp:
@@ -84,7 +86,7 @@ def configure_la66(ser):
     log.info(f"LA66 ready: {LORA_FREQ}MHz SF{LORA_SF} {LORA_POWER}dBm")
     return True
 
-# send all fragments, wait for txDone on each
+# send fragments, wait for txDone on each
 
 tx_seq = 0
 
@@ -94,17 +96,14 @@ def lora_send(ser, data):
     total = len(chunks)
     seq = tx_seq & 0xFF
     tx_seq += 1
-
     log.debug(f"TX: {len(data)} bytes in {total} frags, seq={seq}")
 
     for idx, chunk in enumerate(chunks):
         frame = bytes([seq, idx, total]) + chunk
         hexstr = frame.hex().upper()
-
         ser.reset_input_buffer()
         ser.write(f"AT+SEND=0,{hexstr},0,0\r\n".encode())
 
-        # wait for txDone
         deadline = time.time() + 5.0
         while time.time() < deadline:
             if ser.in_waiting:
@@ -115,9 +114,6 @@ def lora_send(ser, data):
                     log.error(f"TX error: {line}")
                     break
             time.sleep(0.01)
-
-        if idx < total - 1:
-            time.sleep(TX_DELAY)
 
 # reassembly
 
@@ -151,8 +147,6 @@ class Reassembler:
             return result
         return None
 
-# parse LA66 serial output, skip first byte (group byte)
-
 def parse_rx_line(line):
     line = line.strip()
     if not line:
@@ -176,52 +170,41 @@ def parse_rx_line(line):
                 pass
     return None
 
-# read available serial lines, return list of reassembled payloads
+# drain serial and return any reassembled payloads + whether we saw radio activity
 
-def poll_serial(ser, reasm):
+def drain_serial(ser, reasm):
     results = []
+    saw_activity = False
     while ser.in_waiting:
         line = ser.readline().decode(errors="ignore").strip()
         if not line:
             continue
+        # any rxDone or Data line means the other side is transmitting
+        if "rxDone" in line or "Data:" in line:
+            saw_activity = True
         log.debug(f"RX serial: {line}")
         raw = parse_rx_line(line)
         if raw:
             assembled = reasm.feed(raw)
             if assembled:
                 results.append(assembled)
-    return results
+    return results, saw_activity
 
-# listen on serial for a fixed window, collecting any incoming data
-
-def listen_window(ser, reasm, duration):
-    """After sending, listen for incoming data for `duration` seconds."""
-    results = []
-    deadline = time.time() + duration
-    while time.time() < deadline:
-        if ser.in_waiting:
-            line = ser.readline().decode(errors="ignore").strip()
-            if not line:
-                continue
-            log.debug(f"RX serial: {line}")
-            raw = parse_rx_line(line)
-            if raw:
-                assembled = reasm.feed(raw)
-                if assembled:
-                    results.append(assembled)
-        time.sleep(0.005)
-    return results
-
-# main bridge loop
+# main bridge loop with turn-taking
 
 def bridge_loop(ser, tcp_sock, is_server_side):
     reasm = Reassembler()
     ssh_sock = tcp_sock if not is_server_side else None
-    tx_pending = b""  # buffer TCP data, send in batches
+    tx_buf = b""
+    last_rx_time = 0  # last time we saw radio activity from the other side
 
     while True:
-        # 1) poll serial for incoming LoRa data
-        for data in poll_serial(ser, reasm):
+        # 1) drain serial, deliver any complete messages to TCP
+        rx_data, saw_activity = drain_serial(ser, reasm)
+        if saw_activity:
+            last_rx_time = time.time()
+
+        for data in rx_data:
             if is_server_side and ssh_sock is None:
                 log.info("Connecting to SSH...")
                 try:
@@ -230,27 +213,25 @@ def bridge_loop(ser, tcp_sock, is_server_side):
                     ssh_sock.setblocking(False)
                     log.info("SSH connected")
                 except OSError as e:
-                    log.error(f"SSH connect failed: {e}")
-                    continue
+                    log.error(f"SSH connect failed: {e}"); continue
             if ssh_sock:
                 try:
                     ssh_sock.sendall(data)
                     log.debug(f"LoRa -> TCP: {len(data)} bytes")
                 except OSError:
-                    log.error("TCP write failed")
                     if is_server_side:
                         ssh_sock.close(); ssh_sock = None
                     else:
                         return
 
-        # 2) read TCP data into buffer
+        # 2) read TCP into buffer
         if ssh_sock:
             try:
-                ready, _, _ = select.select([ssh_sock], [], [], 0.005)
+                ready, _, _ = select.select([ssh_sock], [], [], 0)
                 if ready:
                     data = ssh_sock.recv(4096)
                     if data:
-                        tx_pending += data
+                        tx_buf += data
                     else:
                         log.info("TCP closed")
                         if is_server_side:
@@ -263,46 +244,31 @@ def bridge_loop(ser, tcp_sock, is_server_side):
                 else:
                     return
 
-        # 3) if we have data to send, send it then listen for response
-        if tx_pending:
-            # small delay to let more TCP data accumulate (coalesce small packets)
-            time.sleep(0.05)
+        # 3) only transmit if we have data AND radio has been quiet
+        #    this prevents us from transmitting while the other side is sending
+        if tx_buf and (time.time() - last_rx_time) > QUIET_TIME:
+            # grab any extra TCP data that arrived
             if ssh_sock:
+                time.sleep(0.03)
                 try:
-                    ready, _, _ = select.select([ssh_sock], [], [], 0.01)
-                    if ready:
+                    while True:
+                        ready, _, _ = select.select([ssh_sock], [], [], 0)
+                        if not ready:
+                            break
                         more = ssh_sock.recv(4096)
                         if more:
-                            tx_pending += more
+                            tx_buf += more
+                        else:
+                            break
                 except OSError:
                     pass
 
-            log.debug(f"TCP -> LoRa: {len(tx_pending)} bytes")
-            lora_send(ser, tx_pending)
-            tx_pending = b""
-
-            # after sending, listen for the other side's response
-            for data in listen_window(ser, reasm, RX_WINDOW):
-                if is_server_side and ssh_sock is None:
-                    log.info("Connecting to SSH...")
-                    try:
-                        ssh_sock = socket.create_connection((SSH_HOST, SSH_PORT))
-                        ssh_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                        ssh_sock.setblocking(False)
-                        log.info("SSH connected")
-                    except OSError as e:
-                        log.error(f"SSH connect failed: {e}"); continue
-                if ssh_sock:
-                    try:
-                        ssh_sock.sendall(data)
-                        log.debug(f"LoRa -> TCP: {len(data)} bytes")
-                    except OSError:
-                        if is_server_side:
-                            ssh_sock.close(); ssh_sock = None
-                        else:
-                            return
+            log.debug(f"TCP -> LoRa: {len(tx_buf)} bytes")
+            lora_send(ser, tx_buf)
+            tx_buf = b""
+            last_rx_time = time.time()  # treat our own TX as activity too
         else:
-            time.sleep(0.01)
+            time.sleep(IDLE_POLL)
 
 def run_jetson(ser):
     log.info("=== JETSON MODE === waiting for LoRa data...")
