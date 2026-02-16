@@ -19,7 +19,7 @@ LORA_POWER = "20"
 LORA_GROUP = "1"
 BAUD       = 9600
 
-# fragmentation - SF7 max is 230 bytes, minus LA66 group byte, minus our 3 byte header
+# fragmentation - SF7 max is 230, minus LA66 group byte, minus 3 byte header
 FRAG_MAX   = 220
 TX_DELAY   = 0.12
 
@@ -28,7 +28,7 @@ LISTEN_PORT = 2222
 SSH_HOST    = "127.0.0.1"
 SSH_PORT    = 22
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s %(levelname)s] %(message)s", datefmt="%H:%M:%S")
+logging.basicConfig(level=logging.DEBUG, format="[%(asctime)s %(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("bridge")
 
 # AT command stuff
@@ -48,11 +48,16 @@ def at_cmd(ser, cmd, timeout=2.0):
 
 def find_la66():
     for p in serial.tools.list_ports.comports():
+        # skip bluetooth ports, they hang
+        desc = (p.description or "").lower()
+        if "bluetooth" in desc or "bt" in desc:
+            log.debug(f"Skipping bluetooth port {p.device}")
+            continue
         log.info(f"Probing {p.device}...")
         try:
-            ser = serial.Serial(p.device, BAUD, timeout=0.1)
+            ser = serial.Serial(p.device, BAUD, timeout=0.5)
             time.sleep(0.3)
-            resp = at_cmd(ser, "AT")
+            resp = at_cmd(ser, "AT", timeout=1.0)
             if "OK" in resp or "AT" in resp:
                 log.info(f"Found LA66 on {p.device}")
                 return ser
@@ -73,30 +78,36 @@ def configure_la66(ser):
         "AT+CRC=1,1", "AT+HEADER=0,0", "AT+IQ=0,0",
         "AT+SYNCWORD=0", "AT+RXMOD=65535,2",
     ]:
-        if "ERROR" in at_cmd(ser, cmd):
-            log.error(f"Config failed: {cmd}")
+        resp = at_cmd(ser, cmd)
+        if "ERROR" in resp:
+            log.error(f"Config failed: {cmd} -> {resp}")
             return False
         time.sleep(0.05)
     log.info(f"LA66 ready: {LORA_FREQ}MHz SF{LORA_SF} {LORA_POWER}dBm")
     return True
 
-# fragmented send - each packet gets [seq, idx, total] + payload
+# fragmented send
 
 tx_seq = 0
 
 def lora_send(ser, data):
     global tx_seq
+    log.debug(f"lora_send: {len(data)} bytes to send")
     chunks = [data[i:i + FRAG_MAX] for i in range(0, len(data), FRAG_MAX)]
     total = len(chunks)
     seq = tx_seq & 0xFF
     tx_seq += 1
     for idx, chunk in enumerate(chunks):
         frame = bytes([seq, idx, total]) + chunk
-        at_cmd(ser, f"AT+SEND=0,{frame.hex().upper()},0,0")
+        hexstr = frame.hex().upper()
+        log.debug(f"TX frag {idx+1}/{total} seq={seq} len={len(chunk)} hexlen={len(hexstr)}")
+        resp = at_cmd(ser, f"AT+SEND=0,{hexstr},0,0")
+        log.debug(f"TX resp: {resp}")
         if idx < total - 1:
             time.sleep(TX_DELAY)
+    log.debug(f"lora_send done: {total} fragments sent")
 
-# reassembly - collect fragments until we have all of them
+# reassembly
 
 class Reassembler:
     def __init__(self):
@@ -114,20 +125,21 @@ class Reassembler:
         seq, idx, total = frame[0], frame[1], frame[2]
         if total == 0 or idx >= total:
             return None
-        # new sequence or timeout
         if self.seq != seq or (time.time() - self.started > 30):
             self.reset()
             self.seq = seq
             self.total = total
             self.started = time.time()
         self.frags[idx] = frame[3:]
+        log.debug(f"RX frag {idx+1}/{total} seq={seq} len={len(frame)-3}")
         if len(self.frags) >= self.total:
             result = b"".join(self.frags[i] for i in range(self.total) if i in self.frags)
+            log.debug(f"Reassembled {len(result)} bytes from {self.total} fragments")
             self.reset()
             return result
         return None
 
-# parse LA66 serial output - format is usually at+recv=rssi,snr,hexdata
+# parse LA66 serial output
 
 def parse_rx_line(line):
     line = line.strip()
@@ -142,7 +154,7 @@ def parse_rx_line(line):
                 pass
     return None
 
-# background thread reads serial and reassembles fragments
+# background serial reader
 
 def serial_reader(ser, reasm, rx_queue, rx_lock):
     buf = ""
@@ -153,6 +165,10 @@ def serial_reader(ser, reasm, rx_queue, rx_lock):
                 buf += chunk.decode(errors="ignore")
                 while "\n" in buf:
                     line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    log.debug(f"serial rx: {line}")
                     raw = parse_rx_line(line)
                     if raw:
                         assembled = reasm.feed(raw)
@@ -164,8 +180,6 @@ def serial_reader(ser, reasm, rx_queue, rx_lock):
             break
         time.sleep(0.005)
 
-# start the serial reader thread (used by both modes)
-
 def start_reader(ser):
     rx_queue, rx_lock, ser_lock = [], threading.Lock(), threading.Lock()
     threading.Thread(
@@ -175,7 +189,7 @@ def start_reader(ser):
     ).start()
     return rx_queue, rx_lock, ser_lock
 
-# jetson mode - LoRa <-> local SSH server
+# jetson mode
 
 def run_jetson(ser):
     log.info("=== JETSON MODE === waiting for LoRa data...")
@@ -194,11 +208,14 @@ def run_jetson(ser):
                     ssh_sock = socket.create_connection((SSH_HOST, SSH_PORT))
                     ssh_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                     ssh_sock.setblocking(False)
+                    log.info("SSH connected")
                 except OSError as e:
                     log.error(f"SSH connect failed: {e}"); continue
             try:
                 ssh_sock.sendall(data)
+                log.debug(f"Sent {len(data)} bytes to SSH")
             except OSError:
+                log.error("SSH write failed")
                 ssh_sock.close(); ssh_sock = None
 
         if ssh_sock:
@@ -206,6 +223,7 @@ def run_jetson(ser):
                 if select.select([ssh_sock], [], [], 0.01)[0]:
                     data = ssh_sock.recv(4096)
                     if data:
+                        log.debug(f"SSH -> LoRa: {len(data)} bytes")
                         with ser_lock: lora_send(ser, data)
                     else:
                         log.info("SSH closed"); ssh_sock.close(); ssh_sock = None
@@ -214,7 +232,7 @@ def run_jetson(ser):
         else:
             time.sleep(0.01)
 
-# windows mode - TCP listener <-> LoRa
+# windows mode
 
 def run_win(ser):
     log.info(f"=== WINDOWS MODE === ssh -p {LISTEN_PORT} user@127.0.0.1")
@@ -237,13 +255,17 @@ def run_win(ser):
                 pending = list(rx_queue)
                 rx_queue.clear()
             for data in pending:
-                try: client.sendall(data)
-                except OSError: log.error("TCP send failed"); return
+                try:
+                    client.sendall(data)
+                    log.debug(f"LoRa -> TCP: {len(data)} bytes")
+                except OSError:
+                    log.error("TCP send failed"); return
 
             try:
                 if select.select([client], [], [], 0.01)[0]:
                     data = client.recv(4096)
                     if data:
+                        log.debug(f"TCP -> LoRa: {len(data)} bytes")
                         with ser_lock: lora_send(ser, data)
                     else:
                         log.info("Client disconnected"); return
