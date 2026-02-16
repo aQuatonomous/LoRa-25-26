@@ -94,11 +94,23 @@ def at_cmd(ser, cmd, timeout=2.0):
     return resp.strip()
 
 def find_la66():
-    for p in serial.tools.list_ports.comports():
+    ports = serial.tools.list_ports.comports()
+    # prioritize CP210x (Silicon Labs 10c4:ea60) — that's the LA66
+    # try those first to avoid probing LiDAR/cameras
+    cp210x = []
+    others = []
+    for p in ports:
         d = (p.description or "").lower()
         if "bluetooth" in d or "bt " in d:
             continue
-        log.info(f"Probing {p.device}...")
+        vid_pid = f"{p.vid:04x}:{p.pid:04x}" if p.vid and p.pid else ""
+        if vid_pid == "10c4:ea60" or "cp210" in d:
+            cp210x.append(p)
+        else:
+            others.append(p)
+
+    for p in cp210x + others:
+        log.info(f"Probing {p.device} ({p.description})...")
         try:
             ser = serial.Serial(p.device, BAUD, timeout=0.1)
             time.sleep(0.5)
