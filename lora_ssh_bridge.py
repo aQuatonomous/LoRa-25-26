@@ -145,6 +145,14 @@ def parse_rx_line(line):
     line = line.strip()
     if not line:
         return None
+    # handle "Data: (HEX:) AA BB CC DD" format
+    if "HEX" in line.upper():
+        hex_part = line.split(")", 1)[-1].strip() if ")" in line else line.split(":", 2)[-1].strip()
+        try:
+            return bytes.fromhex(hex_part.replace(" ", ""))
+        except ValueError:
+            pass
+    # handle "at+recv=rssi,snr,hexdata" format
     for sep in [",", "="]:
         if sep in line:
             candidate = line.rsplit(sep, 1)[1].strip()
