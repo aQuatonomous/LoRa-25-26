@@ -39,9 +39,6 @@ SSH_PASS    = "Robotic2025!"
 
 COMPRESS_MIN = 50
 
-logging.basicConfig(level=logging.DEBUG,
-                    format="[%(asctime)s %(levelname)s] %(message)s",
-                    datefmt="%H:%M:%S")
 log = logging.getLogger("bridge")
 
 # ── compression ────────────────────────────────────────────────
@@ -284,6 +281,37 @@ def tcp_drain(sock):
         return None
     return buf
 
+# ── spinner helper ─────────────────────────────────────────────
+
+class Spinner:
+    """Simple inline spinner for terminal feedback."""
+    def __init__(self, msg=""):
+        self._msg = msg
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+
+    def _spin(self):
+        chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        i = 0
+        while not self._stop.is_set():
+            sys.stdout.write(f"\r  {chars[i % len(chars)]} {self._msg}")
+            sys.stdout.flush()
+            i += 1
+            time.sleep(0.1)
+
+    def stop(self, clear=True):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+        if clear:
+            sys.stdout.write(f"\r{' ' * (len(self._msg) + 6)}\r")
+            sys.stdout.flush()
+
 # ── WINDOWS: interactive terminal (paramiko) ──────────────────
 
 def run_win(ser):
@@ -307,13 +335,11 @@ def run_win(ser):
             cli.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             cli.setblocking(False)
             bridge_ready.set()
-            log.debug("Bridge: internal SSH connection accepted")
 
             while True:
                 time.sleep(0.15)
                 tcp_data = tcp_drain(cli)
                 if tcp_data is None:
-                    log.debug("Bridge: SSH transport closed")
                     return
 
                 if tcp_data:
@@ -324,28 +350,23 @@ def run_win(ser):
                             return
                         if more:
                             tcp_data += more
-                    log.debug(f"TCP->LoRa: {len(tcp_data)}B")
                     reliable_send(ser, tcp_data)
 
                 tx_raw(ser, bytes([T_POLL]))
 
-                rx_data = None
                 while True:
                     data, marker = reliable_recv(ser, timeout=10.0)
                     if data:
-                        rx_data = data
                         try:
                             cli.sendall(data)
-                            log.debug(f"LoRa->TCP: {len(data)}B")
                         except OSError:
                             return
                     if marker == T_DONE:
                         break
                     if marker is None and data is None:
-                        log.warning("Timeout waiting for DONE")
                         break
 
-                if not tcp_data and not rx_data:
+                if not tcp_data and not data:
                     time.sleep(0.3)
 
         except Exception as e:
@@ -357,9 +378,14 @@ def run_win(ser):
     bt = threading.Thread(target=bridge_loop, daemon=True)
     bt.start()
 
-    print(f"\n  aQuatonomous LoRa Terminal")
-    print(f"  Connecting to {SSH_USER}@jetson via LoRa...")
-    print(f"  (this takes ~30-60s for SSH handshake)\n")
+    print()
+    print("  ┌─────────────────────────────────┐")
+    print("  │   aQuatonomous LoRa Terminal     │")
+    print("  └─────────────────────────────────┘")
+    print()
+
+    sp = Spinner("Establishing SSH over LoRa...")
+    sp.start()
 
     try:
         ssh = paramiko.SSHClient()
@@ -369,13 +395,13 @@ def run_win(ser):
                     timeout=120, banner_timeout=120, auth_timeout=120,
                     look_for_keys=False, allow_agent=False,
                     compress=True)
-        print("  Connected!\n")
+        sp.stop()
+        print("  Connected to Jetson via LoRa!")
+        print("  Type commands below. 'exit' to quit.\n")
     except Exception as e:
-        print(f"\n  SSH connection failed: {e}")
+        sp.stop()
+        print(f"  Connection failed: {e}")
         return
-
-    print("  Type commands to run on the Jetson. 'exit' to quit.")
-    print("  Ctrl+C to abort.\n")
 
     try:
         while True:
@@ -390,15 +416,20 @@ def run_win(ser):
             if cmd.lower() in ("exit", "quit"):
                 break
 
+            sp = Spinner("Waiting for response...")
+            sp.start()
+
             try:
                 stdin, stdout, stderr = ssh.exec_command(cmd, timeout=120)
                 out = stdout.read().decode(errors="replace")
                 err = stderr.read().decode(errors="replace")
+                sp.stop()
                 if out:
                     print(out, end="" if out.endswith("\n") else "\n")
                 if err:
                     print(err, end="" if err.endswith("\n") else "\n")
             except Exception as e:
+                sp.stop()
                 print(f"  Error: {e}")
 
     except KeyboardInterrupt:
@@ -472,17 +503,17 @@ def recover_serial(ser):
         ser.close()
     except Exception:
         pass
-    for attempt in range(5):
-        time.sleep(3)
+    for attempt in range(10):
+        time.sleep(5)
         ser_new = find_la66()
         if ser_new:
             if configure_la66(ser_new):
                 log.info("Recovered serial connection")
                 return ser_new
             else:
-                log.error(f"Reconfig failed, retry {attempt+1}/5...")
+                log.error(f"Reconfig failed, retry {attempt+1}/10...")
         else:
-            log.info(f"LA66 not found, retry {attempt+1}/5...")
+            log.info(f"LA66 not found, retry {attempt+1}/10...")
     return None
 
 def run_jetson(ser):
@@ -498,7 +529,7 @@ def run_jetson(ser):
                 log.error("Serial error, attempting recovery...")
                 ser = recover_serial(ser)
                 if not ser:
-                    log.error("LA66 lost after 5 attempts"); return
+                    log.error("LA66 lost after 10 attempts"); return
                 data, marker = None, None
             if data:
                 data_chunks.append(data)
@@ -538,7 +569,7 @@ def run_jetson(ser):
             log.error("Serial error on DONE, attempting recovery...")
             ser = recover_serial(ser)
             if not ser:
-                log.error("LA66 lost after 5 attempts"); return
+                log.error("LA66 lost after 10 attempts"); return
             continue
 
         # let radio settle before switching back to receive
@@ -555,18 +586,39 @@ def main():
         epilog="Modes: jetson (run on Jetson), win (terminal), ssh (legacy passthrough)")
     ap.add_argument("mode", choices=["jetson", "win", "ssh"])
     ap.add_argument("--port", help="serial port override")
+    ap.add_argument("-v", "--verbose", action="store_true", help="show debug logs")
     args = ap.parse_args()
+
+    # win mode: quiet by default, only show terminal output
+    # jetson/ssh mode: show debug logs
+    if args.verbose or args.mode in ("jetson", "ssh"):
+        level = logging.DEBUG
+    else:
+        level = logging.WARNING
+
+    logging.basicConfig(level=level,
+                        format="[%(asctime)s %(levelname)s] %(message)s",
+                        datefmt="%H:%M:%S")
+
+    # suppress paramiko debug noise in win mode
+    if args.mode == "win" and not args.verbose:
+        logging.getLogger("paramiko").setLevel(logging.WARNING)
 
     ser = serial.Serial(args.port, BAUD, timeout=0.1) if args.port else find_la66()
     if not ser:
-        log.error("LA66 not found"); sys.exit(1)
+        print("  LA66 not found!" if args.mode == "win" else "")
+        log.error("LA66 not found")
+        sys.exit(1)
     if not configure_la66(ser):
         sys.exit(1)
 
     try:
         {"jetson": run_jetson, "win": run_win, "ssh": run_ssh}[args.mode](ser)
     except KeyboardInterrupt:
-        log.info("Bye.")
+        if args.mode == "win":
+            print("\n  Bye.")
+        else:
+            log.info("Bye.")
     finally:
         ser.close()
 
