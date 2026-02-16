@@ -121,15 +121,16 @@ def find_la66():
         log.info(f"Probing {p.device} ({p.description})...")
         try:
             ser = serial.Serial(p.device, BAUD, timeout=0.1)
-            time.sleep(0.3)
-            # flush any LiDAR data that might be streaming
+            time.sleep(0.8)
+            # flush any streaming data
             ser.reset_input_buffer()
-            time.sleep(0.2)
-            ser.reset_input_buffer()
-            r = at_cmd(ser, "AT", timeout=1.5)
-            if "OK" in r or "AT" in r:
-                log.info(f"LA66 on {p.device}")
-                return ser
+            # try AT twice — LA66 sometimes needs a nudge after cold open
+            for attempt in range(2):
+                r = at_cmd(ser, "AT", timeout=2.0)
+                if "OK" in r or "AT" in r:
+                    log.info(f"LA66 on {p.device}")
+                    return ser
+                time.sleep(0.3)
             ser.close()
         except (serial.SerialException, OSError):
             continue
