@@ -13,21 +13,20 @@ import serial, serial.tools.list_ports
 
 LORA_FREQ  = "915.000"
 LORA_SF    = "7"
-LORA_BW    = "0"          # 125kHz
-LORA_CR    = "1"          # 4/5
+LORA_BW    = "0"
+LORA_CR    = "1"
 LORA_POWER = "20"
 LORA_GROUP = "1"
 BAUD       = 9600
 
-FRAG_MAX   = 200          # conservative, well under 230 limit
+FRAG_MAX    = 200
 MAX_RETRIES = 3
-RX_TIMEOUT  = 4.0         # seconds to wait for ACK/response
+RX_TIMEOUT  = 4.0
 
-# packet types (first byte after group-byte strip)
-T_DATA = 0x10             # data fragment: [T_DATA, seq, idx, total, ...payload]
-T_ACK  = 0x20             # ack: [T_ACK, seq, idx]
-T_POLL = 0x30             # your turn (win->jetson)
-T_DONE = 0x40             # done (jetson->win)
+T_DATA = 0x10
+T_ACK  = 0x20
+T_POLL = 0x30
+T_DONE = 0x40
 
 LISTEN_PORT = 2222
 SSH_HOST    = "127.0.0.1"
@@ -74,7 +73,6 @@ def find_la66():
 
 def configure_la66(ser):
     log.info("Configuring LA66...")
-    # initial reset
     ser.write(b"ATZ\r\n")
     time.sleep(2.5)
     ser.reset_input_buffer()
@@ -100,13 +98,11 @@ def configure_la66(ser):
             return False
         time.sleep(0.15)
 
-    # ATZ again so "Take effect after ATZ" settings apply
     log.debug("  ATZ (apply settings)...")
     ser.write(b"ATZ\r\n")
     time.sleep(2.5)
     ser.reset_input_buffer()
 
-    # verify radio is alive
     r = at_cmd(ser, "AT", timeout=2.0)
     if "OK" not in r and "AT" not in r:
         log.error("LA66 not responding after config reset!")
@@ -118,7 +114,6 @@ def configure_la66(ser):
 # ── low-level TX/RX ────────────────────────────────────────────
 
 def tx_raw(ser, payload):
-    """Send one LoRa packet. Returns True if txDone received."""
     h = payload.hex().upper()
     ser.reset_input_buffer()
     ser.write(f"AT+SEND=0,{h},0,0\r\n".encode())
@@ -136,12 +131,14 @@ def tx_raw(ser, payload):
     return False
 
 def rx_packet(ser, timeout=4.0):
-    """Wait for one LoRa packet. Returns payload bytes or None."""
     buf = ""
     t = time.time() + timeout
     while time.time() < t:
-        if ser.in_waiting:
-            buf += ser.read(ser.in_waiting).decode(errors="ignore")
+        try:
+            if ser.in_waiting:
+                buf += ser.read(ser.in_waiting).decode(errors="ignore")
+        except serial.SerialException:
+            raise
         while "\n" in buf:
             line, buf = buf.split("\n", 1)
             p = _parse_hex(line.strip())
@@ -151,14 +148,12 @@ def rx_packet(ser, timeout=4.0):
     return None
 
 def _parse_hex(line):
-    """Extract payload from 'Data: (HEX:) XX XX...' line, strip group byte."""
     if "(HEX:)" not in line:
         return None
     i = line.find(")")
     if i < 0:
         return None
     raw = line[i+1:].strip().replace(" ", "")
-    # strip trailing non-hex (txDone, status text etc)
     clean = ""
     for c in raw:
         if c in "0123456789abcdefABCDEF":
@@ -169,16 +164,15 @@ def _parse_hex(line):
         return None
     try:
         b = bytes.fromhex(clean)
-        return b[1:] if len(b) > 1 else None   # drop group byte
+        return b[1:] if len(b) > 1 else None
     except ValueError:
         return None
 
-# ── reliable send: one fragment at a time with ACK ─────────────
+# ── reliable send/recv ─────────────────────────────────────────
 
 tx_seq = 0
 
 def reliable_send(ser, data):
-    """Fragment data and send each fragment with stop-and-wait ACK."""
     global tx_seq
     if not data:
         return True
@@ -192,7 +186,6 @@ def reliable_send(ser, data):
         pkt = bytes([T_DATA, seq, idx, total]) + chunk
         for attempt in range(MAX_RETRIES):
             tx_raw(ser, pkt)
-            # wait for ACK
             resp = rx_packet(ser, timeout=RX_TIMEOUT)
             if resp and len(resp) >= 3 and resp[0] == T_ACK and resp[1] == seq and resp[2] == idx:
                 log.debug(f"  frag {idx+1}/{total} ACKed")
@@ -204,26 +197,25 @@ def reliable_send(ser, data):
     return True
 
 def reliable_recv(ser, timeout=15.0):
-    """Receive fragments, ACK each one. Returns assembled data or None."""
     frags = {}
     expected_total = None
     expected_seq = None
     deadline = time.time() + timeout
 
     while time.time() < deadline:
-        pkt = rx_packet(ser, timeout=min(3.0, deadline - time.time()))
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        pkt = rx_packet(ser, timeout=min(3.0, remaining))
         if pkt is None:
             continue
 
-        # control packets pass through
         if len(pkt) == 1 and pkt[0] in (T_POLL, T_DONE):
-            # deliver any partial data we have + the marker
             assembled = None
             if frags and expected_total:
                 assembled = b"".join(frags[i] for i in range(expected_total) if i in frags)
             return assembled, pkt[0]
 
-        # data fragment
         if len(pkt) >= 4 and pkt[0] == T_DATA:
             seq, idx, total = pkt[1], pkt[2], pkt[3]
             payload = pkt[4:]
@@ -235,9 +227,8 @@ def reliable_recv(ser, timeout=15.0):
             if seq == expected_seq and idx < total:
                 frags[idx] = payload
                 log.debug(f"RX frag {idx+1}/{total} seq={seq} len={len(payload)}")
-                # send ACK
                 tx_raw(ser, bytes([T_ACK, seq, idx]))
-                deadline = time.time() + timeout  # reset timeout
+                deadline = time.time() + timeout
 
                 if len(frags) >= total:
                     assembled = b"".join(frags[i] for i in range(total))
@@ -294,23 +285,28 @@ def run_win(ser):
 
             # send POLL
             tx_raw(ser, bytes([T_POLL]))
-            log.debug("TX POLL")
 
             # receive Jetson's response
+            rx_data = None
             while True:
                 data, marker = reliable_recv(ser, timeout=12.0)
                 if data:
+                    rx_data = data
                     try:
                         cli.sendall(data)
                         log.debug(f"LoRa→TCP: {len(data)}B")
                     except OSError:
                         return
                 if marker == T_DONE:
-                    log.debug("RX DONE")
                     break
                 if marker is None and data is None:
                     log.warning("Timeout waiting for DONE")
                     break
+
+            # slow down empty cycles to avoid hammering radio
+            if not tcp_data and not rx_data:
+                time.sleep(0.5)
+
     finally:
         cli.close(); srv.close()
 
@@ -318,43 +314,60 @@ def run_win(ser):
 
 def run_jetson(ser):
     log.info("=== JETSON (SLAVE) === waiting for POLL...")
-    ssh = None
+    ssh_sock = None
 
     while True:
         # wait for data + POLL from Windows
         data_chunks = []
         while True:
-            data, marker = reliable_recv(ser, timeout=30.0)
+            try:
+                data, marker = reliable_recv(ser, timeout=30.0)
+            except serial.SerialException:
+                log.error("Serial error, attempting recovery...")
+                time.sleep(2)
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser_new = find_la66()
+                if ser_new:
+                    if configure_la66(ser_new):
+                        ser = ser_new
+                        log.info("Recovered serial connection")
+                    else:
+                        log.error("Reconfig failed"); return
+                else:
+                    log.error("LA66 lost"); return
+                data, marker = None, None
             if data:
                 data_chunks.append(data)
             if marker == T_POLL:
-                log.debug("RX POLL")
                 break
             if marker is None and data is None:
                 break
 
         # forward received data to SSH
         for chunk in data_chunks:
-            if ssh is None:
+            if ssh_sock is None:
                 log.info("Connecting to SSH...")
                 try:
-                    ssh = socket.create_connection((SSH_HOST, SSH_PORT))
-                    ssh.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    ssh.setblocking(False)
+                    ssh_sock = socket.create_connection((SSH_HOST, SSH_PORT))
+                    ssh_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    ssh_sock.setblocking(False)
                     log.info("SSH connected")
                 except OSError as e:
                     log.error(f"SSH failed: {e}"); continue
             try:
-                ssh.sendall(chunk)
+                ssh_sock.sendall(chunk)
                 log.debug(f"LoRa→SSH: {len(chunk)}B")
             except OSError:
-                ssh.close(); ssh = None
+                ssh_sock.close(); ssh_sock = None
 
-        # gather SSH response
-        time.sleep(0.1)
-        tcp_data = tcp_drain(ssh) if ssh else b""
+        # gather SSH response — extra time to let SSH process
+        time.sleep(0.15)
+        tcp_data = tcp_drain(ssh_sock) if ssh_sock else b""
         if tcp_data is None:
-            log.info("SSH closed"); ssh = None; tcp_data = b""
+            log.info("SSH closed"); ssh_sock = None; tcp_data = b""
 
         # send response (each frag ACKed)
         if tcp_data:
@@ -363,7 +376,10 @@ def run_jetson(ser):
 
         # send DONE
         tx_raw(ser, bytes([T_DONE]))
-        log.debug("TX DONE")
+
+        # slow down empty cycles
+        if not data_chunks and not tcp_data:
+            time.sleep(0.3)
 
 # ── main ──────────────────────────────────────────────────────
 
