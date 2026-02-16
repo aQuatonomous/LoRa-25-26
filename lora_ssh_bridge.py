@@ -158,19 +158,22 @@ def parse_rx_line(line):
     line = line.strip()
     if not line:
         return None
-    # "Data: (HEX:) AA BB CC DD" format from LA66
+    # "Data: (HEX:) 01 AA BB CC" - first byte is LA66 group, skip it
     if "HEX" in line.upper():
         after = line.split(")", 1)[-1].strip() if ")" in line else line.split(":", 2)[-1].strip()
         try:
-            return bytes.fromhex(after.replace(" ", ""))
+            raw = bytes.fromhex(after.replace(" ", ""))
+            if len(raw) > 1:
+                return raw[1:]  # skip group byte
         except ValueError:
             pass
-    # "at+recv=rssi,snr,hexdata"
     for sep in [",", "="]:
         if sep in line:
             candidate = line.rsplit(sep, 1)[1].strip()
             try:
-                return bytes.fromhex(candidate)
+                raw = bytes.fromhex(candidate)
+                if len(raw) > 1:
+                    return raw[1:]  # skip group byte
             except ValueError:
                 pass
     return None
