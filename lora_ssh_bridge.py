@@ -6,10 +6,8 @@ Windows: python lora_ssh_bridge.py win
 Then:    ssh -p 2222 user@127.0.0.1
 Requires: pip install pyserial
 
-Windows is MASTER, Jetson is SLAVE. Strict turn-taking:
-  Win sends data frags -> sends POLL marker -> listens
-  Jetson receives until POLL -> sends data frags -> sends DONE marker -> listens
-  Repeat. No collisions possible.
+Windows is MASTER, Jetson is SLAVE. Strict turn-taking.
+Each fragment is sent individually and ACKed before the next.
 """
 
 import sys, time, socket, select, logging, argparse
@@ -26,10 +24,11 @@ BAUD       = 9600
 
 # fragmentation
 FRAG_MAX   = 220
+FRAG_DELAY = 0.4  # seconds between fragments to let receiver process
 
-# control markers - single byte packets that signal turn changes
-MARKER_POLL = 0xFE  # win -> jetson: "your turn"
-MARKER_DONE = 0xFD  # jetson -> win: "done, your turn"
+# control markers
+MARKER_POLL = 0xFE
+MARKER_DONE = 0xFD
 
 # network
 LISTEN_PORT = 2222
@@ -83,7 +82,7 @@ def configure_la66(ser):
         f"AT+POWER={LORA_POWER}", f"AT+GROUPMOD={LORA_GROUP},{LORA_GROUP}",
         "AT+CRC=1,1", "AT+HEADER=0,0", "AT+IQ=0,0",
         "AT+SYNCWORD=0",
-        "AT+RXMOD=65535,0",  # always listen, NO ack
+        "AT+RXMOD=65535,0",
     ]:
         resp = at_cmd(ser, cmd)
         if "ERROR" in resp:
@@ -112,7 +111,7 @@ def tx_packet(ser, payload):
     log.warning("TX no txDone")
     return False
 
-# send data as fragments then a marker
+# send data as fragments with delay, then a marker
 
 tx_seq = 0
 
@@ -127,80 +126,37 @@ def send_burst(ser, data, marker):
         for idx, chunk in enumerate(chunks):
             pkt = bytes([seq, idx, total]) + chunk
             tx_packet(ser, pkt)
-    # send marker
+            # delay between frags to let receiver process
+            if idx < total - 1:
+                time.sleep(FRAG_DELAY)
     tx_packet(ser, bytes([marker]))
     log.debug(f"TX marker: {marker:#x}")
 
-# receive: accumulate serial data, extract hex payloads using regex-free approach
-# reads raw bytes, scans buffer for "Data: (HEX:)" lines
-
-def rx_until_marker(ser, marker, reasm, timeout=15.0):
-    """Block until we see our expected marker packet. Returns list of assembled payloads."""
-    results = []
-    buf = ""
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
-        # read raw serial
-        if ser.in_waiting:
-            raw = ser.read(ser.in_waiting)
-            buf += raw.decode(errors="ignore")
-
-        # scan for complete lines
-        while "\n" in buf:
-            line, buf = buf.split("\n", 1)
-            line = line.strip()
-            if not line:
-                continue
-
-            payload = try_parse_hex(line)
-            if payload is None:
-                continue
-
-            # single byte matching marker = control packet
-            if len(payload) == 1 and payload[0] == marker:
-                log.debug(f"RX marker: {marker:#x}")
-                return results
-
-            # data fragment: [seq, idx, total, ...data...]
-            if len(payload) >= 4:
-                assembled = reasm.feed(payload)
-                if assembled:
-                    results.append(assembled)
-
-        time.sleep(0.005)
-
-    log.warning("RX timeout")
-    return results
+# parse hex from LA66 serial output
 
 def try_parse_hex(line):
-    """Try to pull hex bytes from a serial line. Returns bytes or None."""
-    # "Data: (HEX:) XX XX XX XX..." format
-    if "(HEX:)" in line or "(HEX:)" in line.upper():
-        idx = line.find(")")
-        if idx >= 0:
-            hexpart = line[idx+1:].strip()
+    if "(HEX:)" not in line and "(HEX:)" not in line.upper():
+        return None
+    idx = line.find(")")
+    if idx < 0:
+        return None
+    hexpart = line[idx+1:].strip().replace(" ", "")
+    # strip trailing non-hex
+    cleaned = ""
+    for c in hexpart:
+        if c in "0123456789abcdefABCDEF":
+            cleaned += c
         else:
-            hexpart = line.split(":", 2)[-1].strip()
-        # clean: remove spaces, strip trailing garbage (txDone etc can append)
-        hexpart = hexpart.replace(" ", "")
-        # only keep valid hex chars
-        cleaned = ""
-        for c in hexpart:
-            if c in "0123456789abcdefABCDEF":
-                cleaned += c
-            else:
-                break
-        if len(cleaned) >= 4 and len(cleaned) % 2 == 0:
-            try:
-                raw = bytes.fromhex(cleaned)
-                if len(raw) > 1:
-                    return raw[1:]  # skip group byte
-            except ValueError:
-                pass
-    return None
+            break
+    if len(cleaned) < 4 or len(cleaned) % 2 != 0:
+        return None
+    try:
+        raw = bytes.fromhex(cleaned)
+        return raw[1:] if len(raw) > 1 else None  # skip group byte
+    except ValueError:
+        return None
 
-# reassembly
+# receive until marker, with fragment reassembly
 
 class Reassembler:
     def __init__(self):
@@ -227,15 +183,65 @@ class Reassembler:
         log.debug(f"RX frag {idx+1}/{total} seq={seq} len={len(frame)-3}")
         if len(self.frags) >= self.total:
             result = b"".join(self.frags[i] for i in range(self.total) if i in self.frags)
-            log.debug(f"Reassembled {len(result)}B from {self.total} frags")
+            log.debug(f"Reassembled {len(result)}B")
             self.reset()
             return result
         return None
 
+    def flush(self):
+        """Return whatever we have, even if incomplete."""
+        if not self.frags:
+            return None
+        result = b"".join(self.frags[i] for i in sorted(self.frags.keys()))
+        log.warning(f"Flushing partial: {len(self.frags)}/{self.total} frags, {len(result)}B")
+        self.reset()
+        return result
+
+def rx_until_marker(ser, marker, reasm, timeout=15.0):
+    results = []
+    buf = ""
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        if ser.in_waiting:
+            raw = ser.read(ser.in_waiting)
+            buf += raw.decode(errors="ignore")
+
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+
+            payload = try_parse_hex(line)
+            if payload is None:
+                continue
+
+            if len(payload) == 1 and payload[0] == marker:
+                log.debug(f"RX marker: {marker:#x}")
+                # flush any incomplete reassembly
+                partial = reasm.flush()
+                if partial:
+                    results.append(partial)
+                return results, True
+
+            if len(payload) >= 4:
+                assembled = reasm.feed(payload)
+                if assembled:
+                    results.append(assembled)
+
+        time.sleep(0.005)
+
+    # timeout - flush partial
+    partial = reasm.flush()
+    if partial:
+        results.append(partial)
+    log.warning("RX timeout")
+    return results, False
+
 # TCP helpers
 
 def tcp_drain(sock):
-    """Read all available TCP data. Returns bytes or None if closed."""
     if sock is None:
         return b""
     buf = b""
@@ -252,7 +258,7 @@ def tcp_drain(sock):
         return None
     return buf
 
-# Windows (MASTER): send -> poll -> receive -> repeat
+# Windows (MASTER)
 
 def run_win(ser):
     log.info(f"=== WINDOWS (MASTER) === ssh -p {LISTEN_PORT} user@127.0.0.1")
@@ -265,36 +271,34 @@ def run_win(ser):
     client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     client.setblocking(False)
     log.info(f"Client connected: {addr}")
-
     reasm = Reassembler()
 
     try:
         while True:
-            # let TCP data accumulate a bit
             time.sleep(0.05)
             tcp_data = tcp_drain(client)
             if tcp_data is None:
                 log.info("Client disconnected"); return
 
-            # send data + POLL
             if tcp_data:
                 log.debug(f"TCP->LoRa: {len(tcp_data)}B")
             send_burst(ser, tcp_data, MARKER_POLL)
 
-            # wait for Jetson response + DONE
-            rx = rx_until_marker(ser, MARKER_DONE, reasm, timeout=12.0)
+            rx, got_done = rx_until_marker(ser, MARKER_DONE, reasm, timeout=12.0)
 
-            # forward to TCP
             for data in rx:
                 try:
                     client.sendall(data)
                     log.debug(f"LoRa->TCP: {len(data)}B")
                 except OSError:
                     log.error("TCP write failed"); return
+
+            if not got_done:
+                log.warning("No DONE from Jetson, retrying...")
     finally:
         client.close(); srv.close()
 
-# Jetson (SLAVE): wait for poll -> receive -> send -> done -> repeat
+# Jetson (SLAVE)
 
 def run_jetson(ser):
     log.info("=== JETSON (SLAVE) === waiting...")
@@ -302,13 +306,11 @@ def run_jetson(ser):
     ssh_sock = None
 
     while True:
-        # wait for Win data + POLL
-        rx = rx_until_marker(ser, MARKER_POLL, reasm, timeout=30.0)
+        rx, got_poll = rx_until_marker(ser, MARKER_POLL, reasm, timeout=30.0)
 
-        if not rx and not ssh_sock:
-            continue  # nothing received, keep waiting
+        if not got_poll and not rx:
+            continue
 
-        # forward to SSH
         for data in rx:
             if ssh_sock is None:
                 log.info("Connecting to SSH...")
@@ -325,18 +327,14 @@ def run_jetson(ser):
             except OSError:
                 ssh_sock.close(); ssh_sock = None
 
-        # let SSH process and respond
         time.sleep(0.1)
         tcp_data = tcp_drain(ssh_sock) if ssh_sock else b""
         if tcp_data is None:
             log.info("SSH closed"); ssh_sock = None; tcp_data = b""
 
-        # send response + DONE
         if tcp_data:
             log.debug(f"SSH->LoRa: {len(tcp_data)}B")
         send_burst(ser, tcp_data, MARKER_DONE)
-
-# main
 
 def main():
     parser = argparse.ArgumentParser(description="SSH over LoRa (LA66 P2P)")
@@ -346,7 +344,7 @@ def main():
 
     ser = serial.Serial(args.port, BAUD, timeout=0.1) if args.port else find_la66()
     if not ser:
-        log.error("LA66 not found. Plug it in or use --port"); sys.exit(1)
+        log.error("LA66 not found"); sys.exit(1)
     if not configure_la66(ser):
         sys.exit(1)
 
