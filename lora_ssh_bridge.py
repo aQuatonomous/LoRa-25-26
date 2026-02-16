@@ -13,15 +13,15 @@ import serial, serial.tools.list_ports
 # radio config
 LORA_FREQ  = "915.000"
 LORA_SF    = "7"
-LORA_BW    = "0"       # 125kHz
-LORA_CR    = "1"       # 4/5
+LORA_BW    = "0"
+LORA_CR    = "1"
 LORA_POWER = "20"
 LORA_GROUP = "1"
 BAUD       = 9600
 
-# fragmentation - SF7 max is 230, minus LA66 group byte, minus 3 byte header
+# fragmentation
 FRAG_MAX   = 220
-TX_DELAY   = 0.12
+TX_DELAY   = 0.15
 
 # network
 LISTEN_PORT = 2222
@@ -31,9 +31,11 @@ SSH_PORT    = 22
 logging.basicConfig(level=logging.DEBUG, format="[%(asctime)s %(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("bridge")
 
-# AT command stuff
+# single serial lock - everyone takes turns
+ser_lock = threading.Lock()
 
-def at_cmd(ser, cmd, timeout=2.0):
+def serial_write_and_wait(ser, cmd, timeout=3.0):
+    """Send a command and read until OK/ERROR, with the serial lock held."""
     ser.reset_input_buffer()
     ser.write(f"{cmd}\r\n".encode())
     resp = ""
@@ -46,9 +48,12 @@ def at_cmd(ser, cmd, timeout=2.0):
         time.sleep(0.01)
     return resp.strip()
 
+def at_cmd(ser, cmd, timeout=3.0):
+    with ser_lock:
+        return serial_write_and_wait(ser, cmd, timeout)
+
 def find_la66():
     for p in serial.tools.list_ports.comports():
-        # skip bluetooth ports, they hang
         desc = (p.description or "").lower()
         if "bluetooth" in desc or "bt" in desc:
             log.debug(f"Skipping bluetooth port {p.device}")
@@ -57,7 +62,7 @@ def find_la66():
         try:
             ser = serial.Serial(p.device, BAUD, timeout=0.5)
             time.sleep(0.3)
-            resp = at_cmd(ser, "AT", timeout=1.0)
+            resp = serial_write_and_wait(ser, "AT", timeout=1.0)
             if "OK" in resp or "AT" in resp:
                 log.info(f"Found LA66 on {p.device}")
                 return ser
@@ -86,26 +91,50 @@ def configure_la66(ser):
     log.info(f"LA66 ready: {LORA_FREQ}MHz SF{LORA_SF} {LORA_POWER}dBm")
     return True
 
-# fragmented send
+# fragmented send - holds ser_lock for entire send sequence
 
 tx_seq = 0
 
 def lora_send(ser, data):
     global tx_seq
-    log.debug(f"lora_send: {len(data)} bytes to send")
+    log.debug(f"lora_send: {len(data)} bytes")
     chunks = [data[i:i + FRAG_MAX] for i in range(0, len(data), FRAG_MAX)]
     total = len(chunks)
     seq = tx_seq & 0xFF
     tx_seq += 1
-    for idx, chunk in enumerate(chunks):
-        frame = bytes([seq, idx, total]) + chunk
-        hexstr = frame.hex().upper()
-        log.debug(f"TX frag {idx+1}/{total} seq={seq} len={len(chunk)} hexlen={len(hexstr)}")
-        resp = at_cmd(ser, f"AT+SEND=0,{hexstr},0,0")
-        log.debug(f"TX resp: {resp}")
-        if idx < total - 1:
-            time.sleep(TX_DELAY)
-    log.debug(f"lora_send done: {total} fragments sent")
+
+    with ser_lock:
+        for idx, chunk in enumerate(chunks):
+            frame = bytes([seq, idx, total]) + chunk
+            hexstr = frame.hex().upper()
+            log.debug(f"TX frag {idx+1}/{total} seq={seq} len={len(chunk)}")
+
+            # send and wait for txDone (not just OK)
+            ser.reset_input_buffer()
+            ser.write(f"AT+SEND=0,{hexstr},0,0\r\n".encode())
+
+            # wait for OK then txDone
+            resp = ""
+            deadline = time.time() + 5.0
+            got_done = False
+            while time.time() < deadline:
+                if ser.in_waiting:
+                    resp += ser.read(ser.in_waiting).decode(errors="ignore")
+                    if "txDone" in resp:
+                        got_done = True
+                        break
+                    if "ERROR" in resp:
+                        log.error(f"TX error: {resp}")
+                        break
+                time.sleep(0.01)
+
+            if got_done:
+                log.debug(f"TX frag {idx+1}/{total} done")
+            else:
+                log.warn(f"TX frag {idx+1}/{total} no txDone, resp: {resp}")
+
+            if idx < total - 1:
+                time.sleep(TX_DELAY)
 
 # reassembly
 
@@ -134,7 +163,7 @@ class Reassembler:
         log.debug(f"RX frag {idx+1}/{total} seq={seq} len={len(frame)-3}")
         if len(self.frags) >= self.total:
             result = b"".join(self.frags[i] for i in range(self.total) if i in self.frags)
-            log.debug(f"Reassembled {len(result)} bytes from {self.total} fragments")
+            log.debug(f"Reassembled {len(result)} bytes")
             self.reset()
             return result
         return None
@@ -145,14 +174,14 @@ def parse_rx_line(line):
     line = line.strip()
     if not line:
         return None
-    # handle "Data: (HEX:) AA BB CC DD" format
+    # "Data: (HEX:) AA BB CC DD" format
     if "HEX" in line.upper():
         hex_part = line.split(")", 1)[-1].strip() if ")" in line else line.split(":", 2)[-1].strip()
         try:
             return bytes.fromhex(hex_part.replace(" ", ""))
         except ValueError:
             pass
-    # handle "at+recv=rssi,snr,hexdata" format
+    # "at+recv=rssi,snr,hexdata" format
     for sep in [",", "="]:
         if sep in line:
             candidate = line.rsplit(sep, 1)[1].strip()
@@ -162,46 +191,56 @@ def parse_rx_line(line):
                 pass
     return None
 
-# background serial reader
+# serial reader thread - respects ser_lock
 
 def serial_reader(ser, reasm, rx_queue, rx_lock):
     buf = ""
     while True:
-        try:
-            chunk = ser.read(ser.in_waiting or 1)
-            if chunk:
-                buf += chunk.decode(errors="ignore")
-                while "\n" in buf:
-                    line, buf = buf.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    log.debug(f"serial rx: {line}")
-                    raw = parse_rx_line(line)
-                    if raw:
-                        assembled = reasm.feed(raw)
-                        if assembled:
-                            with rx_lock:
-                                rx_queue.append(assembled)
-        except (serial.SerialException, OSError):
-            log.error("Serial port lost!")
-            break
+        # only read when nobody is sending
+        if ser_lock.acquire(timeout=0.01):
+            try:
+                if ser.in_waiting:
+                    chunk = ser.read(ser.in_waiting)
+                    if chunk:
+                        buf += chunk.decode(errors="ignore")
+            except (serial.SerialException, OSError):
+                log.error("Serial port lost!")
+                ser_lock.release()
+                break
+            finally:
+                ser_lock.release()
+
+        # parse lines outside the lock
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            log.debug(f"serial rx: {line}")
+            raw = parse_rx_line(line)
+            if raw:
+                assembled = reasm.feed(raw)
+                if assembled:
+                    with rx_lock:
+                        rx_queue.append(assembled)
+
         time.sleep(0.005)
 
 def start_reader(ser):
-    rx_queue, rx_lock, ser_lock = [], threading.Lock(), threading.Lock()
+    rx_queue = []
+    rx_lock = threading.Lock()
     threading.Thread(
         target=serial_reader,
         args=(ser, Reassembler(), rx_queue, rx_lock),
         daemon=True,
     ).start()
-    return rx_queue, rx_lock, ser_lock
+    return rx_queue, rx_lock
 
 # jetson mode
 
 def run_jetson(ser):
     log.info("=== JETSON MODE === waiting for LoRa data...")
-    rx_queue, rx_lock, ser_lock = start_reader(ser)
+    rx_queue, rx_lock = start_reader(ser)
     ssh_sock = None
 
     while True:
@@ -232,7 +271,7 @@ def run_jetson(ser):
                     data = ssh_sock.recv(4096)
                     if data:
                         log.debug(f"SSH -> LoRa: {len(data)} bytes")
-                        with ser_lock: lora_send(ser, data)
+                        lora_send(ser, data)
                     else:
                         log.info("SSH closed"); ssh_sock.close(); ssh_sock = None
             except OSError:
@@ -255,7 +294,7 @@ def run_win(ser):
     client.setblocking(False)
     log.info(f"Client connected: {addr}")
 
-    rx_queue, rx_lock, ser_lock = start_reader(ser)
+    rx_queue, rx_lock = start_reader(ser)
 
     try:
         while True:
@@ -274,7 +313,7 @@ def run_win(ser):
                     data = client.recv(4096)
                     if data:
                         log.debug(f"TCP -> LoRa: {len(data)} bytes")
-                        with ser_lock: lora_send(ser, data)
+                        lora_send(ser, data)
                     else:
                         log.info("Client disconnected"); return
             except OSError:
