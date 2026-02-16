@@ -294,27 +294,18 @@ def run_win(ser):
         print("paramiko required: pip install paramiko")
         sys.exit(1)
 
-    # We need paramiko to talk SSH through our LoRa bridge.
-    # Strategy: create a local TCP socketpair. Paramiko connects to one end,
-    # our bridge loop pumps the other end through LoRa.
-
-    # Start local TCP listener for the internal SSH connection
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", LISTEN_PORT))
     srv.listen(1)
 
-    # Bridge loop runs in background, pumping TCP <-> LoRa
     bridge_ready = threading.Event()
-    bridge_error = [None]
-    cli_holder = [None]
 
     def bridge_loop():
         try:
             cli, addr = srv.accept()
             cli.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             cli.setblocking(False)
-            cli_holder[0] = cli
             bridge_ready.set()
             log.debug("Bridge: internal SSH connection accepted")
 
@@ -358,7 +349,7 @@ def run_win(ser):
                     time.sleep(0.3)
 
         except Exception as e:
-            bridge_error[0] = e
+            log.error(f"Bridge error: {e}")
             bridge_ready.set()
         finally:
             srv.close()
@@ -366,7 +357,6 @@ def run_win(ser):
     bt = threading.Thread(target=bridge_loop, daemon=True)
     bt.start()
 
-    # Connect paramiko through the bridge
     print(f"\n  aQuatonomous LoRa Terminal")
     print(f"  Connecting to {SSH_USER}@jetson via LoRa...")
     print(f"  (this takes ~30-60s for SSH handshake)\n")
@@ -384,7 +374,6 @@ def run_win(ser):
         print(f"\n  SSH connection failed: {e}")
         return
 
-    # Interactive command loop
     print("  Type commands to run on the Jetson. 'exit' to quit.")
     print("  Ctrl+C to abort.\n")
 
@@ -477,6 +466,25 @@ def run_ssh(ser):
 
 # ── JETSON (slave) ────────────────────────────────────────────
 
+def recover_serial(ser):
+    """Try to recover LA66 serial connection with retries."""
+    try:
+        ser.close()
+    except Exception:
+        pass
+    for attempt in range(5):
+        time.sleep(3)
+        ser_new = find_la66()
+        if ser_new:
+            if configure_la66(ser_new):
+                log.info("Recovered serial connection")
+                return ser_new
+            else:
+                log.error(f"Reconfig failed, retry {attempt+1}/5...")
+        else:
+            log.info(f"LA66 not found, retry {attempt+1}/5...")
+    return None
+
 def run_jetson(ser):
     log.info("=== JETSON (SLAVE) === waiting for POLL...")
     ssh_sock = None
@@ -488,20 +496,9 @@ def run_jetson(ser):
                 data, marker = reliable_recv(ser, timeout=30.0)
             except serial.SerialException:
                 log.error("Serial error, attempting recovery...")
-                time.sleep(2)
-                try:
-                    ser.close()
-                except Exception:
-                    pass
-                ser_new = find_la66()
-                if ser_new:
-                    if configure_la66(ser_new):
-                        ser = ser_new
-                        log.info("Recovered serial connection")
-                    else:
-                        log.error("Reconfig failed"); return
-                else:
-                    log.error("LA66 lost"); return
+                ser = recover_serial(ser)
+                if not ser:
+                    log.error("LA66 lost after 5 attempts"); return
                 data, marker = None, None
             if data:
                 data_chunks.append(data)
@@ -535,7 +532,17 @@ def run_jetson(ser):
             log.debug(f"SSH->LoRa: {len(tcp_data)}B")
             reliable_send(ser, tcp_data)
 
-        tx_raw(ser, bytes([T_DONE]))
+        try:
+            tx_raw(ser, bytes([T_DONE]))
+        except serial.SerialException:
+            log.error("Serial error on DONE, attempting recovery...")
+            ser = recover_serial(ser)
+            if not ser:
+                log.error("LA66 lost after 5 attempts"); return
+            continue
+
+        # let radio settle before switching back to receive
+        time.sleep(0.3)
 
         if not data_chunks and not tcp_data:
             time.sleep(0.2)
