@@ -37,6 +37,7 @@ M_PING     = 0x05
 M_PONG     = 0x06
 
 COMPRESS_MIN = 30
+HEARTBEAT_INTERVAL = 5.0
 
 log = logging.getLogger("bridge")
 
