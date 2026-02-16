@@ -95,25 +95,35 @@ def at_cmd(ser, cmd, timeout=2.0):
 
 def find_la66():
     ports = serial.tools.list_ports.comports()
-    # prioritize CP210x (Silicon Labs 10c4:ea60) — that's the LA66
-    # try those first to avoid probing LiDAR/cameras
-    cp210x = []
+    # Both LA66 and LiDAR are CP210x (10c4:ea60) but LiDAR is CP2104
+    # LA66 is typically CP2102. Try all CP210x but skip ones that say CP2104
+    cp210x_likely = []
+    cp210x_maybe = []
     others = []
     for p in ports:
         d = (p.description or "").lower()
         if "bluetooth" in d or "bt " in d:
             continue
         vid_pid = f"{p.vid:04x}:{p.pid:04x}" if p.vid and p.pid else ""
-        if vid_pid == "10c4:ea60" or "cp210" in d:
-            cp210x.append(p)
+        is_cp210x = vid_pid == "10c4:ea60" or "cp210" in d
+        if is_cp210x:
+            # CP2104 is likely LiDAR, CP2102 is likely LA66
+            if "cp2104" in d:
+                cp210x_maybe.append(p)
+            else:
+                cp210x_likely.append(p)
         else:
             others.append(p)
 
-    for p in cp210x + others:
+    # try likely LA66 first, then maybe, then others
+    for p in cp210x_likely + cp210x_maybe + others:
         log.info(f"Probing {p.device} ({p.description})...")
         try:
             ser = serial.Serial(p.device, BAUD, timeout=0.1)
-            time.sleep(0.5)
+            time.sleep(0.3)
+            # flush any LiDAR data that might be streaming
+            ser.reset_input_buffer()
+            time.sleep(0.2)
             ser.reset_input_buffer()
             r = at_cmd(ser, "AT", timeout=1.5)
             if "OK" in r or "AT" in r:
