@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
 lora_ssh_bridge.py - SSH over LoRa via Dragino LA66 P2P
-Stop-and-wait: one packet at a time, ACK each before sending next.
 
 Jetson:  python3 lora_ssh_bridge.py jetson
 Windows: python lora_ssh_bridge.py win
-Then:    ssh -C -p 2222 user@127.0.0.1
-OR
-ssh -C -p 2222 -o "KexAlgorithms=curve25519-sha256" -o "Ciphers=aes128-ctr" -o "MACs=hmac-sha2-256" lorenzo@127.0.0.1
+         (opens a command prompt — type commands, get output over LoRa)
+         python lora_ssh_bridge.py ssh
+         (legacy mode — listens on port 2222 for external SSH client)
 """
 
-import sys, time, socket, select, logging, argparse
+import sys, time, socket, select, logging, argparse, zlib, threading
 import serial, serial.tools.list_ports
+
+# ── config ─────────────────────────────────────────────────────
 
 LORA_FREQ  = "915.000"
 LORA_SF    = "7"
@@ -23,7 +24,7 @@ BAUD       = 9600
 
 FRAG_MAX    = 200
 MAX_RETRIES = 3
-RX_TIMEOUT  = 2.5          # tightened from 4.0
+RX_TIMEOUT  = 2.5
 
 T_DATA = 0x10
 T_ACK  = 0x20
@@ -33,11 +34,33 @@ T_DONE = 0x40
 LISTEN_PORT = 2222
 SSH_HOST    = "127.0.0.1"
 SSH_PORT    = 22
+SSH_USER    = "lorenzo"
+SSH_PASS    = "Robotic2025!"
+
+COMPRESS_MIN = 50
 
 logging.basicConfig(level=logging.DEBUG,
                     format="[%(asctime)s %(levelname)s] %(message)s",
                     datefmt="%H:%M:%S")
 log = logging.getLogger("bridge")
+
+# ── compression ────────────────────────────────────────────────
+
+def compress(data):
+    if not data or len(data) < COMPRESS_MIN:
+        return b'\x00' + data
+    c = zlib.compress(data, 6)
+    if len(c) < len(data):
+        log.debug(f"  compressed {len(data)}B -> {len(c)}B ({100-len(c)*100//len(data)}% saved)")
+        return b'\x01' + c
+    return b'\x00' + data
+
+def decompress(data):
+    if not data:
+        return b""
+    if data[0] == 0x01:
+        return zlib.decompress(data[1:])
+    return data[1:]
 
 # ── serial helpers ──────────────────────────────────────────────
 
@@ -178,11 +201,12 @@ def reliable_send(ser, data):
     global tx_seq
     if not data:
         return True
-    chunks = [data[i:i+FRAG_MAX] for i in range(0, len(data), FRAG_MAX)]
+    payload = compress(data)
+    chunks = [payload[i:i+FRAG_MAX] for i in range(0, len(payload), FRAG_MAX)]
     total = len(chunks)
     seq = tx_seq & 0xFF
     tx_seq += 1
-    log.debug(f"TX {len(data)}B in {total} frags seq={seq}")
+    log.debug(f"TX {len(data)}B (wire {len(payload)}B) in {total} frags seq={seq}")
 
     for idx, chunk in enumerate(chunks):
         pkt = bytes([T_DATA, seq, idx, total]) + chunk
@@ -215,7 +239,8 @@ def reliable_recv(ser, timeout=15.0):
         if len(pkt) == 1 and pkt[0] in (T_POLL, T_DONE):
             assembled = None
             if frags and expected_total:
-                assembled = b"".join(frags[i] for i in range(expected_total) if i in frags)
+                raw = b"".join(frags[i] for i in range(expected_total) if i in frags)
+                assembled = decompress(raw)
             return assembled, pkt[0]
 
         if len(pkt) >= 4 and pkt[0] == T_DATA:
@@ -233,7 +258,8 @@ def reliable_recv(ser, timeout=15.0):
                 deadline = time.time() + timeout
 
                 if len(frags) >= total:
-                    assembled = b"".join(frags[i] for i in range(total))
+                    raw = b"".join(frags[i] for i in range(total))
+                    assembled = decompress(raw)
                     log.debug(f"Reassembled {len(assembled)}B")
                     return assembled, None
 
@@ -258,10 +284,145 @@ def tcp_drain(sock):
         return None
     return buf
 
-# ── WINDOWS (master) ──────────────────────────────────────────
+# ── WINDOWS: interactive terminal (paramiko) ──────────────────
 
 def run_win(ser):
-    log.info(f"=== WINDOWS (MASTER) === ssh -C -p {LISTEN_PORT} 127.0.0.1")
+    """Combined bridge + terminal. No external SSH client needed."""
+    try:
+        import paramiko
+    except ImportError:
+        print("paramiko required: pip install paramiko")
+        sys.exit(1)
+
+    # We need paramiko to talk SSH through our LoRa bridge.
+    # Strategy: create a local TCP socketpair. Paramiko connects to one end,
+    # our bridge loop pumps the other end through LoRa.
+
+    # Start local TCP listener for the internal SSH connection
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", LISTEN_PORT))
+    srv.listen(1)
+
+    # Bridge loop runs in background, pumping TCP <-> LoRa
+    bridge_ready = threading.Event()
+    bridge_error = [None]
+    cli_holder = [None]
+
+    def bridge_loop():
+        try:
+            cli, addr = srv.accept()
+            cli.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            cli.setblocking(False)
+            cli_holder[0] = cli
+            bridge_ready.set()
+            log.debug("Bridge: internal SSH connection accepted")
+
+            while True:
+                time.sleep(0.15)
+                tcp_data = tcp_drain(cli)
+                if tcp_data is None:
+                    log.debug("Bridge: SSH transport closed")
+                    return
+
+                if tcp_data:
+                    if len(tcp_data) < 50:
+                        time.sleep(0.1)
+                        more = tcp_drain(cli)
+                        if more is None:
+                            return
+                        if more:
+                            tcp_data += more
+                    log.debug(f"TCP->LoRa: {len(tcp_data)}B")
+                    reliable_send(ser, tcp_data)
+
+                tx_raw(ser, bytes([T_POLL]))
+
+                rx_data = None
+                while True:
+                    data, marker = reliable_recv(ser, timeout=10.0)
+                    if data:
+                        rx_data = data
+                        try:
+                            cli.sendall(data)
+                            log.debug(f"LoRa->TCP: {len(data)}B")
+                        except OSError:
+                            return
+                    if marker == T_DONE:
+                        break
+                    if marker is None and data is None:
+                        log.warning("Timeout waiting for DONE")
+                        break
+
+                if not tcp_data and not rx_data:
+                    time.sleep(0.3)
+
+        except Exception as e:
+            bridge_error[0] = e
+            bridge_ready.set()
+        finally:
+            srv.close()
+
+    bt = threading.Thread(target=bridge_loop, daemon=True)
+    bt.start()
+
+    # Connect paramiko through the bridge
+    print(f"\n  aQuatonomous LoRa Terminal")
+    print(f"  Connecting to {SSH_USER}@jetson via LoRa...")
+    print(f"  (this takes ~30-60s for SSH handshake)\n")
+
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect("127.0.0.1", port=LISTEN_PORT,
+                    username=SSH_USER, password=SSH_PASS,
+                    timeout=120, banner_timeout=120, auth_timeout=120,
+                    look_for_keys=False, allow_agent=False,
+                    compress=True)
+        print("  Connected!\n")
+    except Exception as e:
+        print(f"\n  SSH connection failed: {e}")
+        return
+
+    # Interactive command loop
+    print("  Type commands to run on the Jetson. 'exit' to quit.")
+    print("  Ctrl+C to abort.\n")
+
+    try:
+        while True:
+            try:
+                cmd = input("jetson> ")
+            except EOFError:
+                break
+
+            cmd = cmd.strip()
+            if not cmd:
+                continue
+            if cmd.lower() in ("exit", "quit"):
+                break
+
+            try:
+                stdin, stdout, stderr = ssh.exec_command(cmd, timeout=120)
+                out = stdout.read().decode(errors="replace")
+                err = stderr.read().decode(errors="replace")
+                if out:
+                    print(out, end="" if out.endswith("\n") else "\n")
+                if err:
+                    print(err, end="" if err.endswith("\n") else "\n")
+            except Exception as e:
+                print(f"  Error: {e}")
+
+    except KeyboardInterrupt:
+        print("\n")
+    finally:
+        ssh.close()
+        print("  Disconnected.")
+
+# ── WINDOWS: legacy SSH passthrough mode ──────────────────────
+
+def run_ssh(ser):
+    """Legacy mode: listens on port 2222 for external SSH client."""
+    log.info(f"=== SSH PASSTHROUGH === ssh -p {LISTEN_PORT} {SSH_USER}@127.0.0.1")
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", LISTEN_PORT))
@@ -274,13 +435,20 @@ def run_win(ser):
 
     try:
         while True:
-            time.sleep(0.03)
+            time.sleep(0.15)
             tcp_data = tcp_drain(cli)
             if tcp_data is None:
                 log.info("SSH client disconnected"); return
 
             if tcp_data:
-                log.debug(f"TCP→LoRa: {len(tcp_data)}B")
+                if len(tcp_data) < 50:
+                    time.sleep(0.1)
+                    more = tcp_drain(cli)
+                    if more is None:
+                        log.info("SSH client disconnected"); return
+                    if more:
+                        tcp_data += more
+                log.debug(f"TCP->LoRa: {len(tcp_data)}B")
                 reliable_send(ser, tcp_data)
 
             tx_raw(ser, bytes([T_POLL]))
@@ -292,7 +460,7 @@ def run_win(ser):
                     rx_data = data
                     try:
                         cli.sendall(data)
-                        log.debug(f"LoRa→TCP: {len(data)}B")
+                        log.debug(f"LoRa->TCP: {len(data)}B")
                     except OSError:
                         return
                 if marker == T_DONE:
@@ -354,7 +522,7 @@ def run_jetson(ser):
                     log.error(f"SSH failed: {e}"); continue
             try:
                 ssh_sock.sendall(chunk)
-                log.debug(f"LoRa→SSH: {len(chunk)}B")
+                log.debug(f"LoRa->SSH: {len(chunk)}B")
             except OSError:
                 ssh_sock.close(); ssh_sock = None
 
@@ -364,7 +532,7 @@ def run_jetson(ser):
             log.info("SSH closed"); ssh_sock = None; tcp_data = b""
 
         if tcp_data:
-            log.debug(f"SSH→LoRa: {len(tcp_data)}B")
+            log.debug(f"SSH->LoRa: {len(tcp_data)}B")
             reliable_send(ser, tcp_data)
 
         tx_raw(ser, bytes([T_DONE]))
@@ -375,8 +543,10 @@ def run_jetson(ser):
 # ── main ──────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["jetson", "win"])
+    ap = argparse.ArgumentParser(
+        description="SSH over LoRa bridge",
+        epilog="Modes: jetson (run on Jetson), win (terminal), ssh (legacy passthrough)")
+    ap.add_argument("mode", choices=["jetson", "win", "ssh"])
     ap.add_argument("--port", help="serial port override")
     args = ap.parse_args()
 
@@ -387,7 +557,7 @@ def main():
         sys.exit(1)
 
     try:
-        {"jetson": run_jetson, "win": run_win}[args.mode](ser)
+        {"jetson": run_jetson, "win": run_win, "ssh": run_ssh}[args.mode](ser)
     except KeyboardInterrupt:
         log.info("Bye.")
     finally:
