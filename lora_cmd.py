@@ -2,13 +2,12 @@
 """
 lora_cmd.py - Direct command execution over LoRa via Dragino LA66 P2P
 No SSH — commands sent as plaintext, compressed, executed directly on Jetson.
-Much faster than SSH tunnel (no handshake, text compresses 60-80%).
 
 Jetson:  python3 lora_cmd.py jetson
 Windows: python lora_cmd.py win
 """
 
-import sys, time, socket, select, logging, argparse, zlib, threading, subprocess, os
+import sys, time, socket, select, logging, argparse, zlib, threading, subprocess, os, re
 import serial, serial.tools.list_ports
 
 # ── config ─────────────────────────────────────────────────────
@@ -30,17 +29,36 @@ T_ACK  = 0x20
 T_POLL = 0x30
 T_DONE = 0x40
 
-# message types for our protocol
-M_CMD      = 0x01   # windows -> jetson: run this command
-M_STDOUT   = 0x02   # jetson -> windows: stdout output
-M_STDERR   = 0x03   # jetson -> windows: stderr output
-M_EXIT     = 0x04   # jetson -> windows: command finished, payload = return code
-M_PING     = 0x05   # windows -> jetson: are you alive?
-M_PONG     = 0x06   # jetson -> windows: yes
+M_CMD      = 0x01
+M_STDOUT   = 0x02
+M_STDERR   = 0x03
+M_EXIT     = 0x04
+M_PING     = 0x05
+M_PONG     = 0x06
 
 COMPRESS_MIN = 30
 
 log = logging.getLogger("bridge")
+
+# ── RSSI tracking ─────────────────────────────────────────────
+
+last_rssi = None
+
+def rssi_bar(rssi):
+    """Return a signal strength bar like ▂▄▆█ from RSSI."""
+    if rssi is None:
+        return "?"
+    # RSSI typically -30 (strong) to -120 (weak)
+    if rssi > -50:
+        return "████"
+    elif rssi > -70:
+        return "███░"
+    elif rssi > -90:
+        return "██░░"
+    elif rssi > -110:
+        return "█░░░"
+    else:
+        return "░░░░"
 
 # ── compression ────────────────────────────────────────────────
 
@@ -134,6 +152,15 @@ def configure_la66(ser):
     log.info(f"LA66 ready: {LORA_FREQ}MHz SF{LORA_SF} {LORA_POWER}dBm")
     return True
 
+def find_and_configure():
+    """Find LA66 and configure it. Returns ser or None."""
+    ser = find_la66()
+    if ser and configure_la66(ser):
+        return ser
+    if ser:
+        ser.close()
+    return None
+
 # ── low-level TX/RX ────────────────────────────────────────────
 
 def tx_raw(ser, payload):
@@ -154,6 +181,7 @@ def tx_raw(ser, payload):
     return False
 
 def rx_packet(ser, timeout=2.5):
+    global last_rssi
     buf = ""
     t = time.time() + timeout
     while time.time() < t:
@@ -164,7 +192,14 @@ def rx_packet(ser, timeout=2.5):
             raise
         while "\n" in buf:
             line, buf = buf.split("\n", 1)
-            p = _parse_hex(line.strip())
+            stripped = line.strip()
+
+            # extract RSSI from lines like "RSSI:-45" or "AT+RECVB=... RSSI:-45"
+            m = re.search(r'RSSI[=:]\s*(-?\d+)', stripped)
+            if m:
+                last_rssi = int(m.group(1))
+
+            p = _parse_hex(stripped)
             if p is not None:
                 return p
         time.sleep(0.005)
@@ -264,18 +299,15 @@ def reliable_recv(ser, timeout=15.0):
     return None, None
 
 # ── message protocol ───────────────────────────────────────────
-# Messages: [type_byte] + [payload]
-# Sent over reliable_send/recv which handles framing and compression.
 
 def send_msg(ser, msg_type, payload=b""):
     return reliable_send(ser, bytes([msg_type]) + payload)
 
 def recv_msg(ser, timeout=30.0):
-    """Receive a message. Returns (msg_type, payload) or (None, None)."""
     data, marker = reliable_recv(ser, timeout=timeout)
     if data and len(data) >= 1:
         return data[0], data[1:]
-    return None, marker  # marker could be T_POLL/T_DONE
+    return None, marker
 
 # ── spinner ────────────────────────────────────────────────────
 
@@ -320,91 +352,127 @@ def run_win(ser):
     print("  └─────────────────────────────────┘")
     print()
 
-    # ping jetson to make sure it's alive
-    sp = Spinner("Pinging Jetson...")
-    sp.start()
+    while True:
+        # reconnect loop for serial
+        if ser is None:
+            print("  Disconnected from LA66. Reconnecting...")
+            while ser is None:
+                time.sleep(3)
+                ser = find_and_configure()
+            print("  LA66 reconnected!")
 
-    send_msg(ser, M_PING)
-    tx_raw(ser, bytes([T_POLL]))
-    msg_type, payload = recv_msg(ser, timeout=10.0)
+        # ping jetson
+        sp = Spinner("Pinging Jetson...")
+        sp.start()
 
-    # consume DONE marker if present
-    if msg_type == T_DONE:
-        pass
-    elif msg_type == M_PONG:
-        # read until DONE
-        while True:
-            d, m = reliable_recv(ser, timeout=5.0)
-            if m == T_DONE or (d is None and m is None):
-                break
-
-    sp.stop()
-
-    if msg_type == M_PONG:
-        hostname = payload.decode(errors="replace").strip() if payload else "jetson"
-        print(f"  Connected to {hostname} via LoRa!")
-    else:
-        print("  Warning: no response from Jetson (may still work)")
         hostname = "jetson"
+        connected = False
+        try:
+            send_msg(ser, M_PING)
+            tx_raw(ser, bytes([T_POLL]))
+            msg_type, payload = recv_msg(ser, timeout=10.0)
 
-    print("  Type commands below. 'exit' to quit.\n")
+            if msg_type == M_PONG:
+                hostname = payload.decode(errors="replace").strip() if payload else "jetson"
+                connected = True
+                # drain DONE
+                while True:
+                    d, m = reliable_recv(ser, timeout=5.0)
+                    if m == T_DONE or (d is None and m is None):
+                        break
+            elif msg_type == T_DONE:
+                connected = True
+        except serial.SerialException:
+            ser = None
+            sp.stop()
+            continue
 
-    prompt = f"{hostname}> "
+        sp.stop()
 
-    try:
-        while True:
+        if connected:
+            rssi_str = f" {rssi_bar(last_rssi)} {last_rssi}dBm" if last_rssi else ""
+            print(f"  Connected to {hostname} via LoRa!{rssi_str}")
+        else:
+            print("  No response from Jetson. Retrying in 5s...")
+            time.sleep(5)
+            continue
+
+        print("  Type commands below. 'exit' to quit.\n")
+
+        # command loop
+        disconnected = False
+        while not disconnected:
+            rssi_str = f"[{rssi_bar(last_rssi)} {last_rssi}dBm] " if last_rssi else ""
+            prompt = f"{rssi_str}{hostname}> "
+
             try:
                 cmd = input(prompt)
             except EOFError:
-                break
+                return
 
             cmd = cmd.strip()
             if not cmd:
                 continue
             if cmd.lower() in ("exit", "quit"):
-                break
+                return
 
             sp = Spinner("Sending command...")
             sp.start()
 
-            # send command
-            send_msg(ser, M_CMD, cmd.encode())
-            tx_raw(ser, bytes([T_POLL]))
+            try:
+                send_msg(ser, M_CMD, cmd.encode())
+                tx_raw(ser, bytes([T_POLL]))
+            except serial.SerialException:
+                sp.stop()
+                print("  Lost connection to LA66!")
+                ser = None
+                disconnected = True
+                continue
 
             sp.update("Waiting for output...")
 
-            # receive response messages until M_EXIT
             stdout_buf = []
             stderr_buf = []
             exit_code = -1
             got_exit = False
 
-            while not got_exit:
-                msg_type, payload = recv_msg(ser, timeout=60.0)
+            try:
+                while not got_exit:
+                    msg_type, payload = recv_msg(ser, timeout=60.0)
 
-                if msg_type == M_STDOUT and payload:
-                    stdout_buf.append(payload.decode(errors="replace"))
-                elif msg_type == M_STDERR and payload:
-                    stderr_buf.append(payload.decode(errors="replace"))
-                elif msg_type == M_EXIT:
-                    exit_code = int.from_bytes(payload[:4], "big", signed=True) if payload and len(payload) >= 4 else 0
-                    got_exit = True
-                elif msg_type == T_DONE or msg_type is None:
-                    # jetson sent DONE without EXIT — might have more coming
-                    # or timed out
-                    if msg_type is None:
-                        got_exit = True  # timeout, give up
-                    else:
-                        # DONE received, check if there's more after next poll
-                        if not stdout_buf and not stderr_buf:
-                            # nothing yet, poll again
-                            tx_raw(ser, bytes([T_POLL]))
-                        else:
+                    if msg_type == M_STDOUT and payload:
+                        stdout_buf.append(payload.decode(errors="replace"))
+                    elif msg_type == M_STDERR and payload:
+                        stderr_buf.append(payload.decode(errors="replace"))
+                    elif msg_type == M_EXIT:
+                        exit_code = int.from_bytes(payload[:4], "big", signed=True) if payload and len(payload) >= 4 else 0
+                        got_exit = True
+                    elif msg_type == T_DONE:
+                        if stdout_buf or stderr_buf:
                             got_exit = True
+                        else:
+                            tx_raw(ser, bytes([T_POLL]))
+                    elif msg_type is None:
+                        if payload is None:
+                            # total timeout
+                            print("\n  Timeout — Jetson may be disconnected.")
+                            disconnected = True
+                            got_exit = True
+                        elif payload == T_DONE:
+                            if stdout_buf or stderr_buf:
+                                got_exit = True
+                            else:
+                                tx_raw(ser, bytes([T_POLL]))
+
+            except serial.SerialException:
+                sp.stop()
+                print("  Lost connection to LA66!")
+                ser = None
+                disconnected = True
+                continue
 
             sp.stop()
 
-            # print output
             out = "".join(stdout_buf)
             err = "".join(stderr_buf)
             if out:
@@ -413,40 +481,28 @@ def run_win(ser):
                 sys.stderr.write(err)
                 if not err.endswith("\n"):
                     sys.stderr.write("\n")
-            if exit_code != 0 and got_exit:
+            if exit_code != 0 and got_exit and not disconnected:
                 print(f"  (exit code: {exit_code})")
 
-    except KeyboardInterrupt:
-        print("\n")
-    finally:
-        print("  Bye.")
+        # if we got here, we disconnected — loop back to reconnect
+        print()
 
 # ── JETSON (slave) ────────────────────────────────────────────
-
-def recover_serial(ser):
-    try:
-        ser.close()
-    except Exception:
-        pass
-    for attempt in range(10):
-        time.sleep(5)
-        ser_new = find_la66()
-        if ser_new:
-            if configure_la66(ser_new):
-                log.info("Recovered serial connection")
-                return ser_new
-            else:
-                log.error(f"Reconfig failed, retry {attempt+1}/10...")
-        else:
-            log.info(f"LA66 not found, retry {attempt+1}/10...")
-    return None
 
 def run_jetson(ser):
     log.info("=== JETSON (SLAVE) === waiting for commands...")
     hostname = os.uname().nodename
 
     while True:
-        # wait for message + POLL from Windows
+        # reconnect loop for serial
+        if ser is None:
+            log.error("Disconnected from LA66. Reconnecting...")
+            while ser is None:
+                time.sleep(5)
+                ser = find_and_configure()
+            log.info("LA66 reconnected! Waiting for commands...")
+
+        # wait for message + POLL
         msg_type = None
         msg_payload = None
 
@@ -454,11 +510,13 @@ def run_jetson(ser):
             try:
                 data, marker = reliable_recv(ser, timeout=30.0)
             except serial.SerialException:
-                log.error("Serial error, attempting recovery...")
-                ser = recover_serial(ser)
-                if not ser:
-                    log.error("LA66 lost"); return
-                data, marker = None, None
+                log.error("Serial error!")
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser = None
+                break
 
             if data and len(data) >= 1:
                 msg_type = data[0]
@@ -469,22 +527,27 @@ def run_jetson(ser):
             if marker is None and data is None:
                 break
 
-        # handle message
+        if ser is None:
+            continue
+
+        # handle PING
         if msg_type == M_PING:
             log.info("PING received")
-            send_msg(ser, M_PONG, hostname.encode())
             try:
+                send_msg(ser, M_PONG, hostname.encode())
                 tx_raw(ser, bytes([T_DONE]))
             except serial.SerialException:
-                ser = recover_serial(ser)
-                if not ser: return
+                try: ser.close()
+                except: pass
+                ser = None
+                continue
             time.sleep(0.3)
 
+        # handle CMD
         elif msg_type == M_CMD:
             cmd = msg_payload.decode(errors="replace") if msg_payload else ""
             log.info(f"CMD: {cmd}")
 
-            # run command
             try:
                 result = subprocess.run(
                     cmd, shell=True,
@@ -506,33 +569,30 @@ def run_jetson(ser):
 
             log.info(f"  stdout={len(stdout)}B stderr={len(stderr)}B exit={exit_code}")
 
-            # send stdout
-            if stdout:
-                send_msg(ser, M_STDOUT, stdout)
-
-            # send stderr
-            if stderr:
-                send_msg(ser, M_STDERR, stderr)
-
-            # send exit code
-            send_msg(ser, M_EXIT, exit_code.to_bytes(4, "big", signed=True))
-
-            # send DONE
             try:
+                if stdout:
+                    send_msg(ser, M_STDOUT, stdout)
+                if stderr:
+                    send_msg(ser, M_STDERR, stderr)
+                send_msg(ser, M_EXIT, exit_code.to_bytes(4, "big", signed=True))
                 tx_raw(ser, bytes([T_DONE]))
             except serial.SerialException:
-                ser = recover_serial(ser)
-                if not ser: return
+                log.error("Serial error sending response!")
+                try: ser.close()
+                except: pass
+                ser = None
+                continue
 
             time.sleep(0.3)
 
         else:
-            # no command, just respond DONE
             try:
                 tx_raw(ser, bytes([T_DONE]))
             except serial.SerialException:
-                ser = recover_serial(ser)
-                if not ser: return
+                try: ser.close()
+                except: pass
+                ser = None
+                continue
             time.sleep(0.2)
 
 # ── main ──────────────────────────────────────────────────────
@@ -557,12 +617,15 @@ def main():
     ser = serial.Serial(args.port, BAUD, timeout=0.1) if args.port else find_la66()
     if not ser:
         if args.mode == "win":
-            print("  LA66 not found!")
-        log.error("LA66 not found")
-        sys.exit(1)
+            print("  LA66 not found! Will keep trying...")
+            ser = None
+        else:
+            log.error("LA66 not found")
+            ser = None
 
-    if not configure_la66(ser):
-        sys.exit(1)
+    if ser and not configure_la66(ser):
+        ser.close()
+        ser = None
 
     try:
         {"jetson": run_jetson, "win": run_win}[args.mode](ser)
@@ -572,7 +635,8 @@ def main():
         else:
             log.info("Bye.")
     finally:
-        ser.close()
+        if ser:
+            ser.close()
 
 if __name__ == "__main__":
     main()
