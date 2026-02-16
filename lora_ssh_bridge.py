@@ -5,7 +5,7 @@ Stop-and-wait: one packet at a time, ACK each before sending next.
 
 Jetson:  python3 lora_ssh_bridge.py jetson
 Windows: python lora_ssh_bridge.py win
-Then:    ssh -p 2222 user@127.0.0.1
+Then:    ssh -p 2222 lorenzo@127.0.0.1
 """
 
 import sys, time, socket, select, logging, argparse
