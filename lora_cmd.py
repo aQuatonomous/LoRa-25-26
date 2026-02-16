@@ -194,8 +194,8 @@ def rx_packet(ser, timeout=2.5):
             line, buf = buf.split("\n", 1)
             stripped = line.strip()
 
-            # extract RSSI from lines like "RSSI:-45" or "AT+RECVB=... RSSI:-45"
-            m = re.search(r'RSSI[=:]\s*(-?\d+)', stripped)
+            # extract RSSI from lines like "Rssi= -29", "RSSI:-45", etc
+            m = re.search(r'[Rr][Ss][Ss][Ii][=:]\s*(-?\d+)', stripped)
             if m:
                 last_rssi = int(m.group(1))
 
@@ -401,9 +401,38 @@ def run_win(ser):
 
         # command loop
         disconnected = False
+
+        # heartbeat: background thread sends tiny ping every few seconds
+        # to keep RSSI updated while user is idle at prompt
+        hb_stop = threading.Event()
+        def heartbeat_loop():
+            while not hb_stop.is_set():
+                if hb_stop.wait(HEARTBEAT_INTERVAL):
+                    break
+                try:
+                    send_msg(ser, M_PING)
+                    tx_raw(ser, bytes([T_POLL]))
+                    # just drain the pong/done, we only care about RSSI side-effect
+                    recv_msg(ser, timeout=5.0)
+                    while True:
+                        d, m = reliable_recv(ser, timeout=3.0)
+                        if m == T_DONE or (d is None and m is None):
+                            break
+                except serial.SerialException:
+                    break
+                except Exception:
+                    pass
+
+        hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+        hb_thread.start()
+
         while not disconnected:
             rssi_str = f"[{rssi_bar(last_rssi)} {last_rssi}dBm] " if last_rssi else ""
             prompt = f"{rssi_str}{hostname}> "
+
+            # stop heartbeat while we read input (input blocks, but
+            # we stop hb so it doesn't TX while we're typing)
+            hb_stop.set()
 
             try:
                 cmd = input(prompt)
@@ -412,6 +441,10 @@ def run_win(ser):
 
             cmd = cmd.strip()
             if not cmd:
+                # restart heartbeat for idle period
+                hb_stop = threading.Event()
+                hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+                hb_thread.start()
                 continue
             if cmd.lower() in ("exit", "quit"):
                 return
@@ -484,7 +517,14 @@ def run_win(ser):
             if exit_code != 0 and got_exit and not disconnected:
                 print(f"  (exit code: {exit_code})")
 
+            # restart heartbeat for next idle period
+            if not disconnected:
+                hb_stop = threading.Event()
+                hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+                hb_thread.start()
+
         # if we got here, we disconnected — loop back to reconnect
+        hb_stop.set()
         print()
 
 # ── JETSON (slave) ────────────────────────────────────────────
