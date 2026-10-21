@@ -9,7 +9,7 @@ Windows: python lora_ssh_bridge.py win
          (legacy mode — listens on port 2222 for external SSH client)
 """
 
-import sys, time, socket, select, logging, argparse, zlib, threading
+import getpass, os, sys, time, socket, select, logging, argparse, zlib, threading
 import serial, serial.tools.list_ports
 
 # ── config ─────────────────────────────────────────────────────
@@ -34,8 +34,9 @@ T_DONE = 0x40
 LISTEN_PORT = 2222
 SSH_HOST    = "127.0.0.1"
 SSH_PORT    = 22
-SSH_USER    = "lorenzo"
-SSH_PASS    = "Robotic2025!"
+# Credentials come from the environment; never commit them.
+SSH_USER    = os.environ.get("LORA_SSH_USER", "")
+SSH_PASS    = os.environ.get("LORA_SSH_PASS", "")
 
 COMPRESS_MIN = 50
 
@@ -321,6 +322,8 @@ def run_win(ser):
     except ImportError:
         print("paramiko required: pip install paramiko")
         sys.exit(1)
+    user = SSH_USER or input("Jetson user: ")
+    password = SSH_PASS or getpass.getpass("Jetson password: ")
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -391,7 +394,7 @@ def run_win(ser):
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect("127.0.0.1", port=LISTEN_PORT,
-                    username=SSH_USER, password=SSH_PASS,
+                    username=user, password=password,
                     timeout=120, banner_timeout=120, auth_timeout=120,
                     look_for_keys=False, allow_agent=False,
                     compress=True)
@@ -442,7 +445,7 @@ def run_win(ser):
 
 def run_ssh(ser):
     """Legacy mode: listens on port 2222 for external SSH client."""
-    log.info(f"=== SSH PASSTHROUGH === ssh -p {LISTEN_PORT} {SSH_USER}@127.0.0.1")
+    log.info(f"=== SSH PASSTHROUGH === ssh -p {LISTEN_PORT} {SSH_USER or '<user>'}@127.0.0.1")
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", LISTEN_PORT))
